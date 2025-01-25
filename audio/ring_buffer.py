@@ -1,4 +1,4 @@
-wimport numpy as np
+import numpy as np
 from threading import Lock
 
 class RingBuffer:
