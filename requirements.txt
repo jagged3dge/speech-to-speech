@@ -12,7 +12,6 @@ openai>=1.40.1
 useful-moonshine @ git+https://github.com/andimarafioti/moonshine.git
 auto-gptq
 dateparser
-python-dateutils
 spacy
 optimum
 transformers
