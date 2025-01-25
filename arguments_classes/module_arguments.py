@@ -44,3 +44,18 @@ class ModuleArguments:
             "help": "Provide logging level. Example --log_level debug, default=info."
         },
     )
+
+    @staticmethod
+    def add_args(parser):
+        # AEC arguments
+        parser.add_argument(
+            "--use_aec",
+            action="store_true",
+            help="Enable Acoustic Echo Cancellation"
+        )
+        parser.add_argument(
+            "--aec_filter_length",
+            type=int,
+            default=2048,
+            help="Filter length for AEC processing"
+        )

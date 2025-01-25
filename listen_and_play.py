@@ -4,6 +4,7 @@ from queue import Queue
 from dataclasses import dataclass, field
 import sounddevice as sd
 from transformers import HfArgumentParser
+from audio.processor import AudioProcessor
 
 
 @dataclass
@@ -28,101 +29,130 @@ class ListenAndPlayArguments:
         default=12346,
         metadata={"help": "The network port for receiving data. Default is 12346."},
     )
+    use_aec: bool = field(
+        default=False,
+        metadata={"help": "Enable AEC processing. Default is False."},
+    )
 
 
-def listen_and_play(
-    send_rate=16000,
-    recv_rate=44100,
-    list_play_chunk_size=1024,
-    host="localhost",
-    send_port=12345,
-    recv_port=12346,
-):
-    send_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    send_socket.connect((host, send_port))
+class AudioClient:
+    def __init__(self, args):
+        self.send_rate = args.send_rate
+        self.recv_rate = args.recv_rate
+        self.list_play_chunk_size = args.list_play_chunk_size
+        self.host = args.host
+        self.send_port = args.send_port
+        self.recv_port = args.recv_port
+        self.audio_processor = None
+        if args.use_aec:
+            self.audio_processor = AudioProcessor(
+                sample_rate=args.send_rate,
+                frame_size=args.list_play_chunk_size
+            )
 
-    recv_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    recv_socket.connect((host, recv_port))
+    def process_audio(self, audio_data):
+        """Process audio with AEC if enabled"""
+        if self.audio_processor:
+            return self.audio_processor.process_microphone(audio_data)
+        return audio_data
 
-    print("Recording and streaming...")
+    def start(self):
+        """Start audio processing"""
+        if self.audio_processor:
+            self.audio_processor.start_processing()
+        self.send_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.send_socket.connect((self.host, self.send_port))
 
-    stop_event = threading.Event()
-    recv_queue = Queue()
-    send_queue = Queue()
+        self.recv_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.recv_socket.connect((self.host, self.recv_port))
 
-    def callback_recv(outdata, frames, time, status):
-        if not recv_queue.empty():
-            data = recv_queue.get()
-            outdata[: len(data)] = data
-            outdata[len(data) :] = b"\x00" * (len(outdata) - len(data))
-        else:
-            outdata[:] = b"\x00" * len(outdata)
+        print("Recording and streaming...")
 
-    def callback_send(indata, frames, time, status):
-        if recv_queue.empty():
-            data = bytes(indata)
-            send_queue.put(data)
+        self.stop_event = threading.Event()
+        self.recv_queue = Queue()
+        self.send_queue = Queue()
 
-    def send(stop_event, send_queue):
-        while not stop_event.is_set():
-            data = send_queue.get()
-            send_socket.sendall(data)
+        def callback_recv(outdata, frames, time, status):
+            if not self.recv_queue.empty():
+                data = self.recv_queue.get()
+                outdata[: len(data)] = data
+                outdata[len(data) :] = b"\x00" * (len(outdata) - len(data))
+            else:
+                outdata[:] = b"\x00" * len(outdata)
 
-    def recv(stop_event, recv_queue):
-        def receive_full_chunk(conn, chunk_size):
-            data = b""
-            while len(data) < chunk_size:
-                packet = conn.recv(chunk_size - len(data))
-                if not packet:
-                    return None  # Connection has been closed
-                data += packet
-            return data
+        def callback_send(indata, frames, time, status):
+            if self.recv_queue.empty():
+                data = bytes(indata)
+                self.send_queue.put(data)
 
-        while not stop_event.is_set():
-            data = receive_full_chunk(recv_socket, list_play_chunk_size * 2)
-            if data:
-                recv_queue.put(data)
+        def send(stop_event, send_queue):
+            while not stop_event.is_set():
+                data = send_queue.get()
+                self.send_socket.sendall(data)
 
-    try:
-        send_stream = sd.RawInputStream(
-            samplerate=send_rate,
+        def recv(stop_event, recv_queue):
+            def receive_full_chunk(conn, chunk_size):
+                data = b""
+                while len(data) < chunk_size:
+                    packet = conn.recv(chunk_size - len(data))
+                    if not packet:
+                        return None  # Connection has been closed
+                    data += packet
+                return data
+
+            while not stop_event.is_set():
+                data = receive_full_chunk(self.recv_socket, self.list_play_chunk_size * 2)
+                if data:
+                    self.recv_queue.put(data)
+
+        self.send_stream = sd.RawInputStream(
+            samplerate=self.send_rate,
             channels=1,
             dtype="int16",
-            blocksize=list_play_chunk_size,
+            blocksize=self.list_play_chunk_size,
             callback=callback_send,
         )
-        recv_stream = sd.RawOutputStream(
-            samplerate=recv_rate,
+        self.recv_stream = sd.RawOutputStream(
+            samplerate=self.recv_rate,
             channels=1,
             dtype="int16",
-            blocksize=list_play_chunk_size,
+            blocksize=self.list_play_chunk_size,
             callback=callback_recv,
         )
-        threading.Thread(target=send_stream.start).start()
-        threading.Thread(target=recv_stream.start).start()
+        threading.Thread(target=self.send_stream.start).start()
+        threading.Thread(target=self.recv_stream.start).start()
 
-        send_thread = threading.Thread(target=send, args=(stop_event, send_queue))
-        send_thread.start()
-        recv_thread = threading.Thread(target=recv, args=(stop_event, recv_queue))
-        recv_thread.start()
+        self.send_thread = threading.Thread(target=send, args=(self.stop_event, self.send_queue))
+        self.send_thread.start()
+        self.recv_thread = threading.Thread(target=recv, args=(self.stop_event, self.recv_queue))
+        self.recv_thread.start()
 
-        input("Press Enter to stop...")
-
-    except KeyboardInterrupt:
-        print("Finished streaming.")
-
-    finally:
-        stop_event.set()
+    def stop(self):
+        """Stop audio processing"""
+        if self.audio_processor:
+            self.audio_processor.stop_processing()
+        self.stop_event.set()
         # Given that socket::recv is blocking in receive_data_chunk, shut it down to allow the thread to continue.
-        recv_socket.shutdown(socket.SHUT_RDWR)
-        recv_thread.join()
-        send_thread.join()
-        send_socket.close()
-        recv_socket.close()
+        self.recv_socket.shutdown(socket.SHUT_RDWR)
+        self.recv_thread.join()
+        self.send_thread.join()
+        self.send_socket.close()
+        self.recv_socket.close()
         print("Connection closed.")
+
+    def run(self):
+        """Main client loop"""
+        try:
+            self.start()
+            input("Press Enter to stop...")
+        except KeyboardInterrupt:
+            print("Finished streaming.")
+        finally:
+            self.stop()
 
 
 if __name__ == "__main__":
     parser = HfArgumentParser((ListenAndPlayArguments,))
     (listen_and_play_kwargs,) = parser.parse_args_into_dataclasses()
-    listen_and_play(**vars(listen_and_play_kwargs))
+    client = AudioClient(listen_and_play_kwargs)
+    client.run()

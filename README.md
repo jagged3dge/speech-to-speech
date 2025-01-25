@@ -73,6 +73,25 @@ If you want to use Melo TTS, you also need to run:
 python -m unidic download
 ```
 
+## System Dependencies
+
+### SpeexDSP Installation
+
+#### Ubuntu/Debian
+```bash
+sudo apt-get install libspeexdsp-dev
+```
+
+#### macOS
+```bash
+brew install speexdsp
+```
+
+#### Windows
+Download and build SpeexDSP from source or use MSYS2:
+```bash
+pacman -S mingw-w64-x86_64-speexdsp
+```
 
 ## Usage
 
@@ -219,6 +238,20 @@ For example:
 ### Generation parameters
 
 Other generation parameters of the model's generate method can be set using the part's prefix + `_gen_`, e.g., `--stt_gen_max_new_tokens 128`. These parameters can be added to the pipeline part's arguments class if not already exposed.
+
+## Audio Processing Features
+
+### Acoustic Echo Cancellation (AEC)
+The pipeline includes optional Acoustic Echo Cancellation using SpeexDSP:
+- Removes audio feedback and echo
+- Real-time processing with low latency
+- Automatic error recovery
+- See [AEC Documentation](docs/aec.md) for details
+
+To enable AEC:
+```bash
+python s2s_pipeline.py --use_aec
+```
 
 ## Citations
 
