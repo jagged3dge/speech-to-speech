@@ -26,6 +26,7 @@ from arguments_classes.faster_whisper_stt_arguments import (
 from arguments_classes.melo_tts_arguments import MeloTTSHandlerArguments
 from arguments_classes.open_api_language_model_arguments import OpenApiLanguageModelHandlerArguments
 from arguments_classes.facebookmms_tts_arguments import FacebookMMSTTSHandlerArguments
+from arguments_classes.duplex_arguments import DuplexArguments
 import torch
 import nltk
 from rich.console import Console
@@ -88,6 +89,7 @@ def parse_arguments():
             MeloTTSHandlerArguments,
             ChatTTSHandlerArguments,
             FacebookMMSTTSHandlerArguments,
+            DuplexArguments,  # Add the new arguments class
         )
     )
 
@@ -106,6 +108,10 @@ def setup_logger(log_level):
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
     logger = logging.getLogger(__name__)
+    
+    # Set debug level for specific modules
+    logging.getLogger('TTS').setLevel(logging.DEBUG)
+    logging.getLogger('connections.socket_sender').setLevel(logging.DEBUG)
 
     # torch compile logs
     if log_level == "debug":
@@ -213,6 +219,7 @@ def initialize_queues_and_events():
         "spoken_prompt_queue": Queue(),
         "text_prompt_queue": Queue(),
         "lm_response_queue": Queue(),
+        "interrupt_event": Event(),  # Add new event for interruption handling
     }
 
 
@@ -231,6 +238,7 @@ def build_pipeline(
     melo_tts_handler_kwargs,
     chat_tts_handler_kwargs,
     facebook_mms_tts_handler_kwargs,
+    duplex_kwargs,  # Add duplex arguments
     queues_and_events,
 ):
     stop_event = queues_and_events["stop_event"]
@@ -269,17 +277,22 @@ def build_pipeline(
             ),
         ]
 
+    # Update VAD handler with duplex settings if enabled
+    if duplex_kwargs.enable_duplex:
+        vad_handler_kwargs.interrupt_threshold = duplex_kwargs.interrupt_threshold
+        vad_handler_kwargs.enable_duplex = True
+
     vad = VADHandler(
         stop_event,
         queue_in=recv_audio_chunks_queue,
         queue_out=spoken_prompt_queue,
-        setup_args=(should_listen,),
+        setup_args=(should_listen, queues_and_events["interrupt_event"]),  # Add interrupt event
         setup_kwargs=vars(vad_handler_kwargs),
     )
 
     stt = get_stt_handler(module_kwargs, stop_event, spoken_prompt_queue, text_prompt_queue, whisper_stt_handler_kwargs, faster_whisper_stt_handler_kwargs, paraformer_stt_handler_kwargs)
     lm = get_llm_handler(module_kwargs, stop_event, text_prompt_queue, lm_response_queue, language_model_handler_kwargs, open_api_language_model_handler_kwargs, mlx_language_model_handler_kwargs)
-    tts = get_tts_handler(module_kwargs, stop_event, lm_response_queue, send_audio_chunks_queue, should_listen, parler_tts_handler_kwargs, melo_tts_handler_kwargs, chat_tts_handler_kwargs, facebook_mms_tts_handler_kwargs)
+    tts = get_tts_handler(module_kwargs, stop_event, lm_response_queue, send_audio_chunks_queue, should_listen, queues_and_events["interrupt_event"], parler_tts_handler_kwargs, melo_tts_handler_kwargs, chat_tts_handler_kwargs, facebook_mms_tts_handler_kwargs)
 
     return ThreadManager([*comms_handlers, vad, stt, lm, tts])
 
@@ -368,14 +381,14 @@ def get_llm_handler(
         raise ValueError("The LLM should be either transformers or mlx-lm")
 
 
-def get_tts_handler(module_kwargs, stop_event, lm_response_queue, send_audio_chunks_queue, should_listen, parler_tts_handler_kwargs, melo_tts_handler_kwargs, chat_tts_handler_kwargs, facebook_mms_tts_handler_kwargs):
+def get_tts_handler(module_kwargs, stop_event, lm_response_queue, send_audio_chunks_queue, should_listen, interrupt_event, parler_tts_handler_kwargs, melo_tts_handler_kwargs, chat_tts_handler_kwargs, facebook_mms_tts_handler_kwargs):
     if module_kwargs.tts == "parler":
         from TTS.parler_handler import ParlerTTSHandler
         return ParlerTTSHandler(
             stop_event,
             queue_in=lm_response_queue,
             queue_out=send_audio_chunks_queue,
-            setup_args=(should_listen,),
+            setup_args=(should_listen, interrupt_event),  # Add interrupt event
             setup_kwargs=vars(parler_tts_handler_kwargs),
         )
     elif module_kwargs.tts == "melo":
@@ -390,12 +403,12 @@ def get_tts_handler(module_kwargs, stop_event, lm_response_queue, send_audio_chu
             stop_event,
             queue_in=lm_response_queue,
             queue_out=send_audio_chunks_queue,
-            setup_args=(should_listen,),
+            setup_args=(should_listen, interrupt_event),  # Add interrupt event
             setup_kwargs=vars(melo_tts_handler_kwargs),
         )
     elif module_kwargs.tts == "chatTTS":
         try:
-            from TTS.chatTTS_handler import ChatTTSHandler
+            from TTS.chat_tts_handler import ChatTTSHandler
         except RuntimeError as e:
             logger.error("Error importing ChatTTSHandler")
             raise e
@@ -403,7 +416,7 @@ def get_tts_handler(module_kwargs, stop_event, lm_response_queue, send_audio_chu
             stop_event,
             queue_in=lm_response_queue,
             queue_out=send_audio_chunks_queue,
-            setup_args=(should_listen,),
+            setup_args=(should_listen, interrupt_event),  # Add interrupt event
             setup_kwargs=vars(chat_tts_handler_kwargs),
         )
     elif module_kwargs.tts == "facebookMMS":
@@ -412,7 +425,7 @@ def get_tts_handler(module_kwargs, stop_event, lm_response_queue, send_audio_chu
             stop_event,
             queue_in=lm_response_queue,
             queue_out=send_audio_chunks_queue,
-            setup_args=(should_listen,),
+            setup_args=(should_listen, interrupt_event),  # Add interrupt event
             setup_kwargs=vars(facebook_mms_tts_handler_kwargs),
         )
     else:
@@ -427,7 +440,7 @@ def main():
         vad_handler_kwargs,
         whisper_stt_handler_kwargs,
         paraformer_stt_handler_kwargs,
-        faster_whisper_stt_handler_kwargs,  # Add this line
+        faster_whisper_stt_handler_kwargs,
         language_model_handler_kwargs,
         open_api_language_model_handler_kwargs,
         mlx_language_model_handler_kwargs,
@@ -435,6 +448,7 @@ def main():
         melo_tts_handler_kwargs,
         chat_tts_handler_kwargs,
         facebook_mms_tts_handler_kwargs,
+        duplex_kwargs,  # Add duplex arguments
     ) = parse_arguments()
 
     setup_logger(module_kwargs.log_level)
@@ -443,7 +457,7 @@ def main():
         module_kwargs,
         whisper_stt_handler_kwargs,
         paraformer_stt_handler_kwargs,
-        faster_whisper_stt_handler_kwargs,  # Add this line
+        faster_whisper_stt_handler_kwargs,
         language_model_handler_kwargs,
         open_api_language_model_handler_kwargs,
         mlx_language_model_handler_kwargs,
@@ -461,7 +475,7 @@ def main():
         socket_sender_kwargs,
         vad_handler_kwargs,
         whisper_stt_handler_kwargs,
-        faster_whisper_stt_handler_kwargs,  # Add this line
+        faster_whisper_stt_handler_kwargs,
         paraformer_stt_handler_kwargs,
         language_model_handler_kwargs,
         open_api_language_model_handler_kwargs,
@@ -470,6 +484,7 @@ def main():
         melo_tts_handler_kwargs,
         chat_tts_handler_kwargs,
         facebook_mms_tts_handler_kwargs,
+        duplex_kwargs,  # Add duplex arguments
         queues_and_events,
     )
 

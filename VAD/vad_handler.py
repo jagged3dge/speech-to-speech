@@ -23,6 +23,7 @@ class VADHandler(BaseHandler):
     def setup(
         self,
         should_listen,
+        interrupt_event=None,  # Add interrupt event
         thresh=0.3,
         sample_rate=16000,
         min_silence_ms=1000,
@@ -30,8 +31,13 @@ class VADHandler(BaseHandler):
         max_speech_ms=float("inf"),
         speech_pad_ms=30,
         audio_enhancement=False,
+        enable_duplex=False,  # Add duplex mode flag
+        interrupt_threshold=0.8,  # Add interruption threshold
     ):
         self.should_listen = should_listen
+        self.interrupt_event = interrupt_event
+        self.interrupt_threshold = interrupt_threshold
+        self.enable_duplex = enable_duplex
         self.sample_rate = sample_rate
         self.min_silence_ms = min_silence_ms
         self.min_speech_ms = min_speech_ms
@@ -46,12 +52,30 @@ class VADHandler(BaseHandler):
         )
         self.audio_enhancement = audio_enhancement
         if audio_enhancement:
-            self.enhanced_model, self.df_state, _ = init_df()
+            if sample_rate != 16000:
+                logging.warning("SpeexDSP supports 16000 Hz best, forcing 16000.")
+                sample_rate = 16000
+            try:
+                self.enhanced_model, self.df_state, _ = init_df(sample_rate=sample_rate)
+            except Exception as e:
+                logging.error(
+                    f"Error during SpeexDSP initialization: {str(e)}. Disabling enhancement."
+                )
+                self.audio_enhancement = False
 
     def process(self, audio_chunk):
         audio_int16 = np.frombuffer(audio_chunk, dtype=np.int16)
         audio_float32 = int2float(audio_int16)
         vad_output = self.iterator(torch.from_numpy(audio_float32))
+
+        # Check for interruption in duplex mode
+        if self.enable_duplex and not self.should_listen.is_set():
+            speech_prob = self.model(torch.from_numpy(audio_float32), self.sample_rate).item()
+            if speech_prob > self.interrupt_threshold:
+                logger.debug(f"Interruption detected with probability {speech_prob}")
+                if self.interrupt_event:
+                    self.interrupt_event.set()
+
         if vad_output is not None and len(vad_output) != 0:
             logger.debug("VAD: end of speech detected")
             array = torch.cat(vad_output).cpu().numpy()

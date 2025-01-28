@@ -47,6 +47,7 @@ class ParlerTTSHandler(BaseHandler):
     def setup(
         self,
         should_listen,
+        interrupt_event=None,
         model_name="parler-tts/parler-mini-v1-jenny",
         device="cuda",
         torch_dtype="float16",
@@ -61,10 +62,12 @@ class ParlerTTSHandler(BaseHandler):
         use_default_speakers_list=True,
     ):
         self.should_listen = should_listen
+        self.interrupt_event = interrupt_event
         self.device = device
         self.torch_dtype = getattr(torch, torch_dtype)
         self.gen_kwargs = gen_kwargs
         self.compile_mode = compile_mode
+        self.chunk_size = blocksize
         self.max_prompt_pad_length = max_prompt_pad_length
         self.use_default_speakers_list = use_default_speakers_list
         if self.use_default_speakers_list:
@@ -169,47 +172,58 @@ class ParlerTTSHandler(BaseHandler):
                 f"{self.__class__.__name__}:  warmed up! time: {start_event.elapsed_time(end_event) * 1e-3:.3f} s"
             )
 
+    def generate_audio(self, text):
+        """Generate audio from text using Parler TTS"""
+        try:
+            logger.debug(f"Generating audio for text: {text}")
+            model_kwargs = self.prepare_model_inputs(text)
+            audio = self.model.generate(**model_kwargs)[0].cpu().numpy()
+            return audio
+        except Exception as e:
+            logger.error(f"Error in generate_audio: {str(e)}")
+            logger.exception("Full traceback:")
+            return None
+
     def process(self, llm_sentence):
+        language_code = None
         if isinstance(llm_sentence, tuple):
             llm_sentence, language_code = llm_sentence
-            self.speaker = WHISPER_LANGUAGE_TO_PARLER_SPEAKER.get(language_code, "Jason")
-            
+
         console.print(f"[green]ASSISTANT: {llm_sentence}")
-        nb_tokens = len(self.prompt_tokenizer(llm_sentence).input_ids)
+        logger.debug(f"Processing text: {llm_sentence}")
 
-        pad_args = {}
-        if self.compile_mode:
-            # pad to closest upper power of two
-            pad_length = next_power_of_2(nb_tokens)
-            logger.debug(f"padding to {pad_length}")
-            pad_args["pad"] = True
-            pad_args["max_length_prompt"] = pad_length
+        try:
+            logger.debug("Starting Parler TTS generation...")
+            audio_out = self.model.generate_speech(llm_sentence)
+            if audio_out is None:
+                logger.error("Parler TTS generation failed")
+                self.should_listen.set()
+                return
 
-        tts_gen_kwargs = self.prepare_model_inputs(
-            llm_sentence,
-            **pad_args,
-        )
+            logger.debug(f"Generated audio shape: {audio_out.shape}, dtype={audio_out.dtype}")
 
-        streamer = ParlerTTSStreamer(
-            self.model, device=self.device, play_steps=self.play_steps
-        )
-        tts_gen_kwargs = {"streamer": streamer, **tts_gen_kwargs}
-        torch.manual_seed(0)
-        thread = Thread(target=self.model.generate, kwargs=tts_gen_kwargs)
-        thread.start()
+            # Convert float32 to int16
+            audio_data = (audio_out * 32768).astype(np.int16)
+            
+            # Process chunks with interruption check
+            chunk_size = self.chunk_size
+            for i in range(0, len(audio_data), chunk_size):
+                if self.interrupt_event and self.interrupt_event.is_set():
+                    logger.info("Parler TTS interrupted during playback")
+                    self.interrupt_event.clear()
+                    self.should_listen.set()
+                    break
 
-        for i, audio_chunk in enumerate(streamer):
-            global pipeline_start
-            if i == 0 and "pipeline_start" in globals():
-                logger.info(
-                    f"Time to first audio: {perf_counter() - pipeline_start:.3f}"
-                )
-            audio_chunk = librosa.resample(audio_chunk, orig_sr=44100, target_sr=16000)
-            audio_chunk = (audio_chunk * 32768).astype(np.int16)
-            for i in range(0, len(audio_chunk), self.blocksize):
-                yield np.pad(
-                    audio_chunk[i : i + self.blocksize],
-                    (0, self.blocksize - len(audio_chunk[i : i + self.blocksize])),
-                )
+                chunk = audio_data[i:i + chunk_size]
+                if len(chunk) < chunk_size:
+                    # Pad last chunk if needed
+                    chunk = np.pad(chunk, (0, chunk_size - len(chunk)))
+                
+                # logger.debug(f"Sending audio chunk {i//chunk_size + 1}: shape={chunk.shape}, dtype={chunk.dtype}")
+                yield chunk.tobytes()
 
-        self.should_listen.set()
+        except Exception as e:
+            logger.error(f"Error in Parler TTS processing: {e}")
+            logger.exception("Full traceback:")
+        finally:
+            self.should_listen.set()

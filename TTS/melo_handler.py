@@ -5,6 +5,9 @@ import librosa
 import numpy as np
 from rich.console import Console
 import torch
+from threading import Thread
+from time import perf_counter
+from TTS.streamer import InterruptibleParlerTTSStreamer
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +36,7 @@ class MeloTTSHandler(BaseHandler):
     def setup(
         self,
         should_listen,
+        interrupt_event=None,
         device="mps",
         language="en",
         speaker_to_id="en",
@@ -40,8 +44,10 @@ class MeloTTSHandler(BaseHandler):
         blocksize=512,
     ):
         self.should_listen = should_listen
+        self.interrupt_event = interrupt_event  # Store interrupt event
         self.device = device
         self.language = language
+        self.chunk_size = blocksize
         self.model = TTS(
             language=WHISPER_LANGUAGE_TO_MELO_LANGUAGE[self.language], device=device
         )
@@ -55,55 +61,62 @@ class MeloTTSHandler(BaseHandler):
         logger.info(f"Warming up {self.__class__.__name__}")
         _ = self.model.tts_to_file("text", self.speaker_id, quiet=True)
 
+    def generate_audio(self, text):
+        """Generate audio from text using Melo TTS"""
+        try:
+            logger.debug(f"Generating audio for text: {text}")
+            audio = self.model.tts_to_file(text, self.speaker_id, quiet=True)
+            if audio is None:
+                logger.error("Failed to generate audio")
+                return None
+            return audio
+        except Exception as e:
+            logger.error(f"Error in generate_audio: {str(e)}")
+            logger.exception("Full traceback:")
+            return None
+
     def process(self, llm_sentence):
         language_code = None
-
         if isinstance(llm_sentence, tuple):
             llm_sentence, language_code = llm_sentence
 
         console.print(f"[green]ASSISTANT: {llm_sentence}")
-
-        if language_code is not None and self.language != language_code:
-            try:
-                self.model = TTS(
-                    language=WHISPER_LANGUAGE_TO_MELO_LANGUAGE[language_code],
-                    device=self.device,
-                )
-                self.speaker_id = self.model.hps.data.spk2id[
-                    WHISPER_LANGUAGE_TO_MELO_SPEAKER[language_code]
-                ]
-                self.language = language_code
-            except KeyError:
-                console.print(
-                    f"[red]Language {language_code} not supported by Melo. Using {self.language} instead."
-                )
-
-        if self.device == "mps":
-            import time
-
-            start = time.time()
-            torch.mps.synchronize()  # Waits for all kernels in all streams on the MPS device to complete.
-            torch.mps.empty_cache()  # Frees all memory allocated by the MPS device.
-            _ = (
-                time.time() - start
-            )  # Removing this line makes it fail more often. I'm looking into it.
+        logger.debug(f"Processing text: {llm_sentence}")
+        logger.debug(f"Language code: {language_code}")
 
         try:
-            audio_chunk = self.model.tts_to_file(
-                llm_sentence, self.speaker_id, quiet=True
-            )
-        except (AssertionError, RuntimeError) as e:
-            logger.error(f"Error in MeloTTSHandler: {e}")
-            audio_chunk = np.array([])
-        if len(audio_chunk) == 0:
-            self.should_listen.set()
-            return
-        audio_chunk = librosa.resample(audio_chunk, orig_sr=44100, target_sr=16000)
-        audio_chunk = (audio_chunk * 32768).astype(np.int16)
-        for i in range(0, len(audio_chunk), self.blocksize):
-            yield np.pad(
-                audio_chunk[i : i + self.blocksize],
-                (0, self.blocksize - len(audio_chunk[i : i + self.blocksize])),
-            )
+            # Generate audio
+            logger.debug("Starting Melo TTS generation...")
+            audio_out = self.generate_audio(llm_sentence)
+            if audio_out is None:
+                logger.error("Melo TTS generation failed")
+                self.should_listen.set()
+                return
 
-        self.should_listen.set()
+            logger.debug(f"Generated audio shape: {audio_out.shape}")
+
+            # Process chunks with interruption check
+            chunk_size = self.chunk_size
+            audio_data = librosa.resample(audio_out, orig_sr=44100, target_sr=16000)
+            audio_data = (audio_data * 32768).astype(np.int16)
+            
+            for i in range(0, len(audio_data), chunk_size):
+                if self.interrupt_event and self.interrupt_event.is_set():
+                    logger.info("Melo TTS interrupted during playback")
+                    self.interrupt_event.clear()
+                    self.should_listen.set()
+                    break
+
+                chunk = audio_data[i:i + chunk_size]
+                if len(chunk) < chunk_size:
+                    # Pad last chunk if needed
+                    chunk = np.pad(chunk, (0, chunk_size - len(chunk)))
+                
+                # logger.debug(f"Sending audio chunk {i//chunk_size + 1}/{len(audio_data)//chunk_size + 1}")
+                yield chunk.tobytes()
+
+        except Exception as e:
+            logger.error(f"Error in Melo TTS processing: {e}")
+            logger.exception("Full traceback:")
+        finally:
+            self.should_listen.set()
