@@ -12,6 +12,27 @@ console = Console()
 
 logger = logging.getLogger(__name__)
 
+KOKORO_DEFAULT_VOICES = [
+    "af_alloy",
+    "af_aoede",
+    "af_bella",
+    "af_jessica",
+    "af_kore",
+    "af_nicole",
+    "af_nova",
+    "af_river",
+    "af_sarah",
+    "af_sky",
+    "am_adam",
+    "am_echo",
+    "am_eric",
+    "am_fenrir",
+    "am_liam",
+    "am_michael",
+    "am_onyx",
+    "am_puck",
+]
+
 
 class KokoroTTSHandler(BaseHandler):
     def setup(
@@ -22,6 +43,7 @@ class KokoroTTSHandler(BaseHandler):
         language="en",
         gen_kwargs=None,
         blocksize=512,
+        voice="af_bella",
     ):
         """
         Proper initialization using KPipeline
@@ -46,11 +68,16 @@ class KokoroTTSHandler(BaseHandler):
 
         # Set default generation parameters
         self.default_params = {
-            'voice': 'af_bella',  # Default voice
+            'voice': voice,  # Default voice
             'speed': 1.0,
             'split_pattern': r'\n+',  # Split on newlines
         }
         self.default_params.update(self.gen_kwargs)
+
+        # Validate voice selection
+        if self.default_params['voice'] not in KOKORO_DEFAULT_VOICES:
+            raise ValueError(
+                f"Invalid voice '{self.default_params['voice']}'. Must be one of {KOKORO_DEFAULT_VOICES}")
 
         self.warmup()
 
@@ -59,7 +86,8 @@ class KokoroTTSHandler(BaseHandler):
         logger.info(f"Initializing Kokoro TTS on {self.device}")
         try:
             # Run a short generation to load all components
-            list(self.pipeline("Warmup", voice=self.default_params['voice'], speed=1.0))
+            list(self.pipeline(
+                "Warmup", voice=self.default_params['voice'], speed=1.0))
             if self.device == "cuda":
                 torch.cuda.empty_cache()
         except Exception as e:
@@ -85,7 +113,8 @@ class KokoroTTSHandler(BaseHandler):
             ):
                 # Validate pipeline output structure
                 if len(result) != 3:
-                    logger.warning(f"Skipping invalid pipeline output: {result}")
+                    logger.warning(
+                        f"Skipping invalid pipeline output: {result}")
                     continue
 
                 _, _, audio_tensor = result
@@ -115,7 +144,7 @@ class KokoroTTSHandler(BaseHandler):
             # Concatenate and process final audio
             full_audio = np.concatenate(audio_chunks)
             full_audio = librosa.to_mono(full_audio)
-            
+
             # Resample while still in floating-point (Kokoro uses 24kHz)
             target_sr = 16000
             if sample_rate != target_sr:
@@ -124,7 +153,7 @@ class KokoroTTSHandler(BaseHandler):
                     orig_sr=sample_rate,
                     target_sr=target_sr
                 )
-            
+
             # Convert to int16 after resampling
             full_audio = librosa.util.normalize(full_audio) * 32767.0
             full_audio = full_audio.astype(np.int16)
